@@ -1,0 +1,86 @@
+Creating a new Skia Backend.
+
+The API for SKIA to draw is is the class SkCanvas. That class delegates
+the actual drawing to an SkBaseDevice derived object. The base class
+SkBaseDevive, defined in SkDevice.h and implemented in SkDevice.cpp,
+defines the interface that SkCanvas will use to draw.
+
+Good news:
+  0. Building and using SKIA in applications is no longer anywhere
+     nearly as painful as it used to be. The build process will
+     now emit a single .a or .so (one chooses) that one can link
+     against. Updating the skia-painter-cells demo to use the current
+     SKIA only took a day and resulted in a much cleaner makefile.
+  1. SkBaseDevice tracks clipping entirely itself, this will allow
+     a FastUIDraw implementation to implement its efficient clipping
+     algorithm.
+  2. There are direct methods to implement to draw:
+      - rects
+      - rounded rects
+      - ovals
+      - arcs
+      - double rounded rect (i.e. clipout by inner rect and draw outer rect)
+      - path drawing (SkPaint controls to stroke or fill)
+      - glyphs
+      - a number of other primitives as well
+
+Bad news:
+  1. SkBaseDevice only has a method to set the full 3x3 matrix completely.
+     FastUIDraw makes good use of knowing if a transition transformation
+     is a translation or scaling operation and has optimizations for this.
+     Recognizing that a transformation is these is nasty-messy involving
+     a 3x3 matrix inverse, a full 3x3 matrix multiply, and then fuzzy detection
+     to view small values as zero. To alleviate this, we will need to add
+     the various methods to SkDevice and the implementation to use them in
+     SkCanvas.
+
+  2. fastuidraw::PainterBrush of FastUIDraw is the analogue of SkPaint of SKIA.
+     However, SkPaint works in terms of shaders specified by SkShader which
+     can be arbitarily combined. Years ago I did experiment where I allowed
+     to chain arbitary shader effects to implement PainterBrush (the effects
+     were gradient, image, tiling, transformation) and there was a significant
+     negative performance impact against having the functionality fixed
+     statically. 
+       a. Gradients are effects, defined in include/effects/SkGradient.h
+       b. The implementation is spread across src/shaders/gradients and
+          src/gpu/effects.
+       c. ISSUE: the code is somewhat hardwired to either realize a CPU
+          implementation of the gradient (for raster drawing) or to use
+          the current GPU backend (Gr).
+       d. Not very clear how to piggy back the necessary information on
+          SkShader to realize the combinations that can be supported by
+          a PainterBrush as a PainterBrush.
+       e. We can in theory support a number of elementary effects directly
+          with PainterBrush and then support some small level of combining.
+          However, this is quite tricky to write and we MUST make sure that
+          this path is ALWAYS hit in Blink.
+       f. There might be a way to make the combining a little more limited
+          (in that the total amount of data transmitted to the vertex shader
+          to the fragment shader is not too large) and keep performance.
+          However, it is a large implementation effort in FastUIDraw to do so.
+          This combining we can realized as part of the PainterBrush.
+       g. The class that will need the most modification is SkShaderBase which
+          is a -private- class in SKIA. With some irony, SkShader is the
+          base class to SkShaderBase (one can view that SkShader follows
+          the PIMPL pattern to some degree and its private implementation
+          is sort-of-ish SkShaderBase). 
+
+  3. The method drawVertices() is going to be a major implementation effort
+     to implement entirely on the GPU; even if the vertex processing will not
+     be done on the GPU, it still needs to be realized as a custom item shader
+     in FastUIDraw. This method likely cannot be skipped because it seems that
+     lots of other methods get mapped to it.
+
+  4. That there is a specific call to draw text (items of text represented by
+     an SkGlyphRun), we will want to attach a fastuidraw::GlyphSequence object
+     to it to allow for caching (specifically glyph look up into the GlyphCache).
+
+  5. It is not clear if we should implement in FastUIDraw a specific Path type
+     to embody the idea of a Path which is used once (i.e. an application is
+     animating a path by creating a new path each frame). The main issue is for
+     filling. Currently FastUIDraw triangulates paths and this can be an expensive
+     operation to be done per-frame. Testing will need to be done to see how
+     expensive it it and if it is, for such paths, we may need to realize that
+     path filling with a two-pass stencil like operation (there is a way to keep
+     it all in one draw call). However, anti-aliasing with such a fill algorithm
+     is essentially a research problem (I have ideas how to do it though).
