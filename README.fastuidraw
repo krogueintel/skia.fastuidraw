@@ -5,6 +5,115 @@ the actual drawing to an SkBaseDevice derived object. The base class
 SkBaseDevive, defined in SkDevice.h and implemented in SkDevice.cpp,
 defines the interface that SkCanvas will use to draw.
 
+One will need to add additional API points into SkBaseDevice for
+a FastUIDraw backend in order to allow for FastUIDraw's optimizations
+to kick in.
+
+  1. Transformations. SkBase device only has methods to set the 3x3
+     transformation, rather than also having methods to modify it
+     (for example translate(), shear(), rotate(), etc). The issue
+     is that translating and then clipping in by a rectangle is MUCH
+     cheaper than setting the transformation and then clipping in
+     by a rectangle. One will need to add methods, in some way, so
+     that fastuidraw::Painter gets that the new transformation
+     only differs from the old transformation by a translation and/or
+     shearing when that is the case.
+
+  2. SkPaint is SKIA's "how" to draw that is passed on almost all drawing
+     methods in SkCanvas and echoed to SkBaseDevice. An SkPaint
+     holds how to stroke, what blend mode to apply, what brush to
+     apply and so on. The main tricky part is the SkShader that can
+     be attached to an SkPaint. The SkShader class has static methods
+     to create and combine SkShader objects. However, these objects
+     themselves are just really holders for data the describes how to
+     generate an actual shader. The static methods of SkShader that
+     create SkShader objects are found across several source files in
+     src/core/shaders. The GPU backend in SKIA is -invasively- implemented
+     in SkShader derived objects by having a method return a reference to
+     a GrFragmentProcessor. Likely the easiest way to get proof of concept
+     code working is to also invasively add a method that returns a
+     reference to a fastuidraw::PainterBrushShader. MASSIVE care is needed
+     to make sure that multiple shaders are not made that do the same thing.
+     Each additional shader added to FastUIDraw makes its uber-shader larger
+     (and the starting if/else chain in particular). One way to handle this
+     is to introduce a ShaderFactory whose job is to make the shaders and
+     have the SkShader derived objects have a reference to the factory needed.
+
+      class FastUIDrawShaderFactory
+      {
+      private:
+        class ShaderParameters //represents parameters that affect the shader source.
+        {
+        };
+
+        const reference_counted_ptr<PainterBrushShader>&
+        asFastUIDrawShader(const ShaderParameters &params)
+        {
+           auto iter = m_shaders.find(params);
+           if (iter != m_shaders.end())
+             {
+                return iter->second;
+             }
+
+           reference_counted_ptr<PainterBrushShader> &return_value(m_shaders[params]);
+
+           // create the shader at return_value
+
+           // register the shader to -THE- PainterShaderRegistar
+           FastUIDrawSKIABackend::GetPaintEngine().register_shader(return_value);
+  
+           return return_value;
+        }
+      
+      public:
+        // std::map if you can write an operator< or
+        // std::unordered_map if you can write a hash function
+        std::map<ShaderParameters, reference_counted_ptr<PainterBrushShader> > m_shaders;
+      }
+
+     The function FastUIDrawSKIABackend::GetPaintEngine() would return *THE*
+     fastuidraw::PainterEngine object that the backend would have. Having
+     multiple PainterEngine objects alive serves no point UNLESS there are multiple
+     GL/GLES contexts active that are NOT in the same share group. In that case,
+     each GL/GLES context -SHARE GROUP- needs to have its own PainterEngine.
+     In truth, the best thing to do is to make sure that all the GL/GLES contexts
+     are in the same share group.    
+
+  3. Handling effects such as blur and transparency is done in FastUIDraw
+     by the class fastuidraw::PainterEffect.
+
+  4. Rendering Paths needs to be done with a great deal of caution. The issue
+     is that a fastuidraw::Path is very heavy and represents a great deal of
+     cached computed data from the source Path. In addition, fastuidraw::Path
+     is quite different than SkPath. Likely what is best when using FastUIDraw
+     to -stroke- an SkPath is to use the SkPath::Iter interface to walk the
+     path to tessellate its curves and use fastuidraw::PainterAttributeWrite
+     together with fastuidraw::StrokedPointPacking and/or fastuidraw::ArcStrokedPointPacking
+     to stream the vertices and indices to stroke the path. Filling is trickier.
+     To compute the fill of a path is -quite- CPU expensive. One way out of this
+     is to use fastuidraw::ShaderFilledPath which lets a GPU fragment shader
+     do the winding computation. Inside of FastUIDraw, there is the routines
+     in src/fastuidraw/internal/private/bezier_util.hpp one can use to approximate
+     cubic and arcs with quadratic curves. In the case of using fastuidraw::ShaderFilledPath
+     to fill SkPath, it is best to create the object lazily and to clear the internal
+     value of it whenever the SkPath changes.
+
+  5. Handling text. FastUIDraw only has support for scalable fonts that are loadable
+     by FreeType. The main issue is to extract the FT_Face object of an SkFont to
+     use fastuidraw::FontFreeType. Alternatively, one can create one's own class
+     derived from fastuidraw::FontBase. The implementation of fastuidraw::FontFreeType
+     is really just a wrapper over FreeType's FT_Face to extract the geometry of a
+     named glyph and possible to render the glyph (at low pixel sizes only). When
+     choosing what fastuidraw::GlyphRenderer to use, the general advice is that unless
+     the pixel size is really small to either use fastuidraw::banded_rays_glyph or
+     fastuidraw::restricted_rays_glyph. Both have very similair performance characteristics
+     but fastuidraw::banded_rays_glyph is faster under smaller glyph render sizes where
+     as fastuidraw::restricted_rays_glyph is faster for largeer render sizes. However,
+     fastuidraw::banded_rays_glyph will begin to manifest anti-aliasing artifacts if
+     the glyph is rendered with a large amount of skewing where as fastuidraw::restricted_rays_glyph
+     anti-aliasing is robust against skewing.
+     
+
 Good news:
   0. Building and using SKIA in applications is no longer anywhere
      nearly as painful as it used to be. The build process will
@@ -84,3 +193,12 @@ Bad news:
      path filling with a two-pass stencil like operation (there is a way to keep
      it all in one draw call). However, anti-aliasing with such a fill algorithm
      is essentially a research problem (I have ideas how to do it though).
+
+  6. saveLayer() and related calls. Skia has a render-to-surface feature embodied
+     by saveLayer(). The basic idea is that an application can call saveLayer()
+     to indicate to render to a surface and then when done, that surface is blitted
+     with an SkPaint applied to it. This is a MUST feature to implement in FastUIDraw.
+     What exactly is needed by SKIA is a little tricky to see, the main players
+     for SkDevice are onCreateDevice() to "create a device to which to draw content",
+     makeSpecial(), snapSpecial() and drawSpecial() which are active sometimes and
+     I do not see what they do or for that matter exactly what a SkSpecialImage is.
